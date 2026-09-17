@@ -2,6 +2,10 @@
 
 ### The unofficial library
 
+### Universal LoRa telemetry bridge application
+
+The isolated [Universal LoRa Bridge example](examples/Universal_LoRa_Bridge/README.md) adds bidirectional binary serial transport, ACK/retry handling, pairing, rotating OLED status and a Master-only live WebSocket dashboard. Both boards use the same firmware. See its README for wiring, build instructions and transport limits.
+
 ![](images/ESP32_LoRa_v3.png)
 
 <p align="right"><kbd><b><a href="#quick-reference">Quick Reference</a></b></kbd></p>

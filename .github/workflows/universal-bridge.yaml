@@ -1,0 +1,30 @@
+name: Universal LoRa Bridge
+on:
+  push:
+    paths: ['examples/Universal_LoRa_Bridge/**', 'tests/universal_bridge/**', 'src/**', '.github/workflows/universal-bridge.yaml']
+  pull_request:
+    paths: ['examples/Universal_LoRa_Bridge/**', 'tests/universal_bridge/**', 'src/**', '.github/workflows/universal-bridge.yaml']
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test binary transport and observer isolation
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I tests/universal_bridge/fakes -I examples/Universal_LoRa_Bridge tests/universal_bridge/protocol_test.cpp examples/Universal_LoRa_Bridge/ReliableLink.cpp -o /tmp/bridge-test
+          /tmp/bridge-test
+          g++ -std=c++17 -Wall -Wextra -Werror -I tests/universal_bridge/fakes -I examples/Universal_LoRa_Bridge tests/universal_bridge/serial_test.cpp examples/Universal_LoRa_Bridge/SerialBridge.cpp -o /tmp/serial-test
+          /tmp/serial-test
+          node tests/universal_bridge/dashboard_test.js
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install pinned build dependencies
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.0 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install RadioLib@7.2.1 HotButton@0.1.1 "ESP8266 and ESP32 OLED driver for SSD1306 displays@4.6.2" WebSockets@2.7.0
+      - name: Compile Heltec V3 firmware
+        run: arduino-cli compile --fqbn esp32:esp32:heltec_wifi_lora_32_V3 --library . --warnings all examples/Universal_LoRa_Bridge
