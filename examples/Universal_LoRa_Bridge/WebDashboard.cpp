@@ -68,7 +68,8 @@ void WebDashboard::run() {
       char hex[PayloadMax*2+1]; const char* digits = "0123456789ABCDEF";
       for (size_t j = 0; j < event.length; ++j) { hex[j*2] = digits[event.data[j] >> 4]; hex[j*2+1] = digits[event.data[j] & 15]; }
       hex[event.length*2] = 0;
-      snprintf(json, sizeof(json), "{\"type\":\"payload\",\"direction\":\"%s\",\"timestamp\":%lu,\"length\":%u,\"hex\":\"%s\"}", event.tx ? "TX" : "RX", (unsigned long)event.timestamp, event.length, hex);
+      snprintf(json, sizeof(json), "{\"type\":\"payload\",\"direction\":\"%s\",\"timestamp\":%lu,\"length\":%u,\"hex\":\"%s\",\"source\":%lu,\"destination\":%lu,\"sequence\":%lu,\"outcome\":%u}", event.tx ? "TX" : "RX", (unsigned long)event.timestamp, event.length, hex,
+        (unsigned long)event.source, (unsigned long)event.destination, (unsigned long)event.sequence, event.outcome);
       ws.broadcastTXT(json);
     }
     if (xQueueReceive(snapshots, &snapshot, 0) == pdTRUE) {

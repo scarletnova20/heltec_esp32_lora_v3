@@ -36,7 +36,7 @@ For Arduino IDE, install this repository as a library, open `Universal_LoRa_Brid
 1. Attach the antennas and power both boards. Both initially start as Remote with Wi-Fi off.
 2. On the board attached to your dashboard computer, hold **PRG for 6–7 seconds, then release**. It saves the Master role and restarts. Repeat this gesture to switch back to Remote. Role selection is stored in NVS, not compiled into the firmware. The earlier 3-second role gesture now opens the message menu instead.
 3. Join `LoRa-Bridge-XXXXXXXX`, password **`LoRaBridge32`**, and open **http://192.168.4.1**. The HTTP page uses **ws://192.168.4.1:81/ws** for both live payloads and statistics. It does not poll or refresh for messages.
-4. Remote pairing is open for 60 seconds after startup. A **double-click** opens another 60-second window. Select the discovered Remote using **Pair** on the Master dashboard.
+4. An unpaired Remote always accepts pairing, even long after startup. A 6–7 second hold changes role; it does not initiate pairing. Keep exactly one Master and one Remote. Select the discovered Remote using **Pair** on the Master dashboard.
 5. Pairing is persistent and one-to-one. To replace a pair, stop senders and clear pairing on **both** boards: hold PRG **8 seconds or longer, then release**, or use the dashboard's local Unpair control on Master. Unpair is rejected while application queues or settings transactions are busy.
 
 The local Master is shown separately from discovered nodes and never needs to hear its own announcement. Each valid received protocol frame updates its sender's discovery `lastHeard`. Discovery entries are bounded to eight; stale entries remain visible with their age and cannot be selected for pairing.
@@ -96,7 +96,7 @@ Application diagnostics never write to the telemetry port. ESP32 ROM/bootloader 
 
 ## Master payload console
 
-- **TX** is the local queued payload copied when selected for RF transport, once per chunk, before its first attempt. **RX** is a Remote payload copied after validation/deduplication and acceptance into the local serial output queue. PRG test messages also appear as TX/RX, but are delivered to the OLED instead of serial.
+- **TX** is the local queued payload copied when selected for RF transport, once per chunk, before its first attempt. **RX** identifies either incoming Remote data accepted by Master, or Remote receipt of Master data confirmed by an ACK. Confirmation rows are explicitly labelled and include the original payload copy. PRG test messages also appear as TX/RX, but are delivered to the OLED instead of serial.
 - Timestamps are Master uptime in milliseconds, displayed as `hh:mm:ss.mmm`; they are not wall-clock time. Millisecond timestamps wrap after approximately 49 days.
 - **TEXT** displays printable ASCII and escapes other bytes as `\xNN`. **HEX** displays every byte. **AUTO** uses text only for entirely printable ASCII chunks. Original bytes remain available when changing display modes.
 - **Clear** clears only the browser's history. **Autoscroll** controls only the browser viewport. History is limited to 500 events.
@@ -107,7 +107,7 @@ The transport passes `const uint8_t*` payloads to a logger that copies into a **
 Events use this lossless format:
 
 ```json
-{"type":"payload","direction":"RX","timestamp":123789,"length":4,"hex":"FD0900FF"}
+{"type":"payload","direction":"RX","timestamp":123789,"length":4,"hex":"FD0900FF","source":2,"destination":1,"sequence":7,"outcome":0}
 ```
 
 Statistics are pushed over the same WebSocket at up to 4 Hz, using a one-slot overwrite queue. Remote never starts Wi-Fi, HTTP or a WebSocket service. The Master sees remote outgoing traffic as its own RX; no extra payload mirroring frames are sent over LoRa.
@@ -158,3 +158,9 @@ Before operational use, perform these tests with two physical boards:
 Hardware timings, usable range, RF interference and electrical UART behavior require this bench validation; simulation does not establish those properties.
 
 API references: [RadioLib SX126x](https://jgromes.github.io/RadioLib/class_s_x126x.html), [Arduino ESP32 UART](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/serial.html), [arduinoWebSockets](https://github.com/Links2004/arduinoWebSockets).
+
+### Console node identity and pairing recovery
+
+All laptops on the same Master Wi-Fi see the same dashboard. Each event now names both node IDs. A Master TX is followed by a Remote RX confirmation only after a valid ACK; its timestamp is when Master observed the ACK. This confirms acceptance at the Remote, not consumption by the attached laptop. Incoming Remote payloads are shown as RX at Master. Exhausted retries show delivery UNCONFIRMED. These observer events never echo data into serial, and do not change packet/byte statistics. Text, HEX, Clear and Autoscroll apply to every row.
+
+A failed pairing attempt releases the Master selection so Pair can be retried. A Remote already bound to this Master can be selected again after a one-sided reset/unpair. A Remote bound to a different node must first be unpaired. Changing role clears the local pairing. The discovery button explains role conflicts, stale nodes and conflicting pairs instead of silently disabling Pair. Flash both boards with this version.

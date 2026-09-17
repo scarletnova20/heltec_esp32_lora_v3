@@ -41,7 +41,7 @@ class ReliableLink {
   void startPending(const Packet& p, uint32_t now);
   void complete(bool success, uint32_t now);
   bool applyPreset(uint8_t preset);
-  void observe(bool tx, const uint8_t* bytes, size_t length, uint32_t now);
+  void observe(bool tx, const uint8_t* bytes, size_t length, uint32_t now, uint32_t seq = 0, uint8_t outcome = 0);
   uint32_t ackTimeout();
   void fallback(uint32_t now);
  public:

@@ -28,7 +28,7 @@ struct Board {
   Snapshot snapshot() { Snapshot s; link.snapshot(s,testNow);return s; }
 };
 struct World {
-  Board a,b; unsigned dropAcks=0; bool allAcks=false,dropData=false,drain=true;
+  Board a,b; unsigned dropAcks=0; bool allAcks=false,dropData=false,dropPair=false,drain=true;
   std::vector<uint8_t> atA,atB;
   World(bool paired=true) { testNow=0; a.begin(1,true,paired?2:0); b.begin(2,false,paired?1:0); }
   void deliver(Board& from,Board& to) {
@@ -36,7 +36,7 @@ struct World {
     if(r.scan&&due(testNow,r.finishAt)){r.scan=false;r.irq=true;return;}
     if(!r.tx || !due(testNow,r.finishAt))return;
     Packet p; assert(decode(r.sent.data(),r.sent.size(),p));
-    bool drop=dropData&&p.kind==Kind::Data;
+    bool drop=(dropData&&p.kind==Kind::Data)||(dropPair&&p.kind==Kind::Pair);
     if(p.kind==Kind::Ack&&(allAcks||dropAcks)){drop=true;if(dropAcks)--dropAcks;}
     if(!drop&&!r.collision&&to.radio.receiving&&to.radio.bw==r.bw&&to.radio.sf==r.sf) {
       to.radio.inbox=r.sent;to.radio.irq=true;to.radio.receiving=false;
@@ -89,7 +89,11 @@ static void bidirectional() {
   }
   assert(w.atA==b&&w.atB==a);assert(w.a.snapshot().counters.retries+w.b.snapshot().counters.retries>0);
   assert(w.a.snapshot().counters.duplicates+w.b.snapshot().counters.duplicates>0);
-  std::vector<uint8_t> tx,rx;PayloadEvent e;while(w.a.log.pop(e)){auto& v=e.tx?tx:rx;v.insert(v.end(),e.data,e.data+e.length);}
+  std::vector<uint8_t> tx,rx,confirmed;PayloadEvent e;while(w.a.log.pop(e)){
+    assert(e.source==(e.tx||e.outcome==1?1u:2u));assert(e.destination==(e.tx||e.outcome==1?2u:1u));
+    auto& v=e.outcome==1?confirmed:e.tx?tx:rx;v.insert(v.end(),e.data,e.data+e.length);
+  }
+  assert(confirmed==a);
   assert(tx==a&&rx==b);assert(w.b.log.size()==0);
 }
 static void boundedRetries() {
@@ -101,7 +105,7 @@ static void saturation() {
   World w;w.connect();uint8_t payload[PayloadMax]{};
   for(unsigned i=0;i<LogDepth;++i)assert(w.a.log.copy(true,payload,sizeof(payload),testNow));
   w.a.serial.incoming.push(payload,sizeof(payload));w.run(10000);
-  assert(w.atB.size()==sizeof(payload));assert(w.a.snapshot().counters.logDrops==1);assert(w.a.snapshot().counters.acknowledged==1);
+  assert(w.atB.size()==sizeof(payload));assert(w.a.snapshot().counters.logDrops==2);assert(w.a.snapshot().counters.acknowledged==1);
   w.drain=false;uint8_t full[BufferSize]{};assert(w.b.serial.outgoing.push(full,sizeof(full)));
   w.a.serial.incoming.push(payload,sizeof(payload));w.run(1000);assert(w.a.snapshot().counters.acknowledged==1);
   w.b.serial.outgoing.discard(sizeof(full));w.drain=true;w.run(20000);assert(w.a.snapshot().counters.acknowledged==2);assert(w.atB.size()==2*sizeof(payload));
@@ -168,7 +172,8 @@ static void boardMessages() {
   assert(!memcmp(b.receivedMessage.data,"Hello from 00000001",b.receivedMessage.length));
   assert(w.atA.empty()&&w.atB.empty()); // Test messages never reach USB/UART.
   assert(a.counters.txPackets==1&&a.counters.rxPackets==1&&b.counters.rxPackets==1);
-  PayloadEvent e;unsigned tx=0,rx=0;while(w.a.log.pop(e)){if(e.tx)++tx;else ++rx;}
+  PayloadEvent e;unsigned tx=0,rx=0,confirmed=0;while(w.a.log.pop(e)){if(e.outcome==1)++confirmed;else if(e.tx)++tx;else ++rx;}
+  assert(confirmed==1);
   assert(tx==1&&rx==1); // ACK loss must not repeat console events.
   const uint8_t binary[]={0,0xfd,13,10,0xff};
   w.a.serial.incoming.push(binary,sizeof(binary));w.b.serial.incoming.push(binary,sizeof(binary));
@@ -181,5 +186,27 @@ static void boardMessages() {
   World lost;lost.connect();lost.allAcks=true;lost.a.link.command(send,testNow);lost.run(90000);
   assert(lost.a.snapshot().sentMessage.state==MessageState::Unconfirmed);
   assert(lost.b.snapshot().counters.rxPackets==1&&lost.atB.empty());
+  unsigned unconfirmed=0;while(lost.a.log.pop(e)){assert(e.outcome!=1);if(e.outcome==2)++unconfirmed;}assert(unconfirmed==1);
 }
-int main(){framing();observer();bidirectional();boundedRetries();saturation();pairingAndSettings();failedSettingsAndStaleSession();buttonMenu();boardMessages();std::cout<<"All bridge protocol, transport, discovery, settings, observer, button-menu and board-message tests passed\n";}
+static void pairingRecovery() {
+  Command pair;pair.type=CommandType::Pair;pair.value=2;
+  World late(false);late.run(70000); // The old 60-second window has expired.
+  late.a.link.command(pair,testNow);late.run(20000);
+  assert(late.a.snapshot().linked&&late.b.snapshot().linked);
+  World failed(false);failed.dropPair=true;failed.run(7000);
+  failed.a.link.command(pair,testNow);failed.run(60000);
+  assert(!failed.a.settings.peer&&!failed.b.settings.peer);
+  failed.dropPair=false;failed.a.link.command(pair,testNow);failed.run(20000);
+  assert(failed.a.snapshot().linked&&failed.b.snapshot().linked);
+  World asymmetric(false);asymmetric.b.settings.peer=1;asymmetric.run(7000);
+  asymmetric.a.link.command(pair,testNow);asymmetric.run(20000);
+  assert(asymmetric.a.snapshot().linked&&asymmetric.b.snapshot().linked);
+  World conflict(false);conflict.b.settings.master=true;conflict.run(7000);
+  conflict.a.link.command(pair,testNow);assert(!conflict.a.settings.peer);
+  assert(strstr(conflict.a.snapshot().status,"Both boards are Master"));
+  conflict.b.settings.master=false;conflict.b.settings.peer=99;conflict.run(7000);
+  conflict.a.link.command(pair,testNow);assert(!conflict.a.settings.peer);
+  assert(strstr(conflict.a.snapshot().status,"Remote paired elsewhere"));
+  conflict.b.settings.role(true);assert(!conflict.b.settings.peer);
+}
+int main(){framing();observer();bidirectional();boundedRetries();saturation();pairingAndSettings();failedSettingsAndStaleSession();buttonMenu();boardMessages();pairingRecovery();std::cout<<"All bridge protocol, transport, discovery, settings, observer, button-menu, board-message and pairing recovery tests passed\n";}

@@ -21,7 +21,7 @@ class SettingsManager {
     interfaceMode = mode <= 2 ? Interface(mode) : Interface::Auto;
     active = saved; active.preset = 1; active.token = 0; // Always rendezvous on Balanced after reboot.
   }
-  void role(bool value) { master = value; store.putBool("master", value); }
+  void role(bool value) { if (master != value) pair(0); master = value; store.putBool("master", value); }
   void pair(uint32_t value) { peer = value; store.putUInt("peer", peer); }
   void interface(Interface value) { interfaceMode = value; store.putUChar("iface", uint8_t(value)); }
   void stage(const Settings& value, uint32_t now) {

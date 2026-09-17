@@ -44,8 +44,10 @@ bool ReliableLink::channelClear(uint32_t now) {
   }
   scanning = true; radioDeadline = now + ackTimeout(); return false;
 }
-void ReliableLink::observe(bool tx, const uint8_t* bytes, size_t length, uint32_t now) {
-  if (settings.master && !log.copy(tx, bytes, length, now)) ++stats.logDrops;
+void ReliableLink::observe(bool tx, const uint8_t* bytes, size_t length, uint32_t now, uint32_t seq, uint8_t outcome) {
+  const bool fromMaster = tx || outcome == 1;
+  if (settings.master && !log.copy(tx, bytes, length, now,
+      fromMaster ? id : settings.peer, fromMaster ? settings.peer : id, seq, outcome)) ++stats.logDrops;
 }
 void ReliableLink::startPending(const Packet& p, uint32_t now) {
   pending = p; pending.sequence = sequence++; havePending = true; waiting = false; attempts = 0;
@@ -57,6 +59,7 @@ void ReliableLink::acknowledge(const Packet& p) {
 }
 void ReliableLink::complete(bool success, uint32_t now) {
   if (pending.kind == Kind::Data || pending.kind == Kind::Message) {
+    observe(!success, pending.data, pending.length, now, pending.sequence, success ? 1 : 2);
     if (success) ++stats.acknowledged;
     else { ++stats.failed; stats.failedBytes += pending.length; message("Retry limit: payload delivery unconfirmed"); }
     if (pending.kind == Kind::Message) {
@@ -70,7 +73,8 @@ void ReliableLink::complete(bool success, uint32_t now) {
       settings.stage(value, now); message("Settings acknowledged; RF change scheduled");
     } else message("Settings ACK missing; rendezvous recovery enabled");
   } else if (pending.kind == Kind::Pair) {
-    message(success ? "Pair request acknowledged" : "Pair ACK missing; check Remote and pairing window");
+    if (!success && !linked) settings.pair(0);
+    message(linked ? "Peer connected" : success ? "Pair acknowledged; waiting for heartbeat" : "Pair failed; Pair can be retried. Check Remote role and power");
   }
   havePending = waiting = false; nextSend = now + 100 + esp_random() % 400;
 }
@@ -104,7 +108,7 @@ void ReliableLink::receive(uint32_t now) {
   }
   if (p.kind == Kind::Pair) {
     if (settings.master || p.length || !p.destination ||
-        (settings.peer != p.source && (due(now, pairUntil) || settings.peer))) return;
+        (settings.peer && settings.peer != p.source)) return;
     if (settings.peer != p.source) settings.pair(p.source);
     if (peerSession != p.session) { peerSession = p.session; received.reset(); }
     acknowledge(p); nextHello = now + 200; message("Paired; awaiting peer heartbeat"); return;
@@ -125,14 +129,14 @@ void ReliableLink::receive(uint32_t now) {
     memcpy(receivedMessage.data, p.data, p.length);
     received.accept(p.sequence); acknowledge(p);
     ++stats.rxPackets; stats.rxBytes += p.length;
-    observe(false, p.data, p.length, now);
+    observe(false, p.data, p.length, now, p.sequence);
   } else if (p.kind == Kind::Data) {
     if (!p.length) return;
     // Reserve downstream space BEFORE ACK. Never acknowledge bytes that cannot be retained.
     if (!serial.outgoing.push(p.data, p.length)) { ++stats.backpressure; return; }
     received.accept(p.sequence); acknowledge(p);
     ++stats.rxPackets; stats.rxBytes += p.length;
-    observe(false, p.data, p.length, now);
+    observe(false, p.data, p.length, now, p.sequence);
   } else {
     if (settings.master || p.length != 9 || p.data[0] > 2 || !validBaud(get32(p.data + 1)) ||
         settings.pending || havePending || messageQueued || serial.incoming.size() || serial.outgoing.size()) return;
@@ -213,14 +217,15 @@ void ReliableLink::tick(bool irq, uint32_t now) {
   if (!havePending && linked && !settings.pending && messageQueued) {
     messageQueued = false;
     ++stats.txPackets; stats.txBytes += queuedMessage.length;
-    observe(true, queuedMessage.data, queuedMessage.length, now);
     sentMessage.state = MessageState::Sending; sentMessage.timestamp = now;
     startPending(queuedMessage, now);
+    observe(true, pending.data, pending.length, now, pending.sequence);
   } else if (!havePending && linked && !settings.pending && serial.incoming.size()) {
     Packet p = packet(Kind::Data); p.length = serial.incoming.peek(p.data, PayloadMax);
     serial.incoming.discard(p.length);
-    ++stats.txPackets; stats.txBytes += p.length; observe(true, p.data, p.length, now);
+    ++stats.txPackets; stats.txBytes += p.length;
     startPending(p, now);
+    observe(true, pending.data, pending.length, now, pending.sequence);
   }
   // Restore the saved RF preset after both rebooted onto the common rendezvous profile.
   if (settings.master && linked && !havePending && !settings.pending && settings.active.token == 0 &&
@@ -253,11 +258,19 @@ void ReliableLink::command(const Command& c, uint32_t now) {
   } else if (c.type == CommandType::Send) {
     ok = c.length && c.length <= PayloadMax && serial.incoming.push(c.data, c.length);
     if (ok) message("Web payload queued (no serial echo)");
-  } else if (c.type == CommandType::Pair && settings.master && !havePending && !settings.pending && !settings.peer) {
+  } else if (c.type == CommandType::Pair) {
+    if (!settings.master) { ++stats.commandRejects; message("Only Master can initiate pairing"); return; }
+    if (havePending || settings.pending) { ++stats.commandRejects; message("Link busy; wait before retrying Pair"); return; }
+    if (settings.peer && settings.peer != c.value) { ++stats.commandRejects; message("Unpair local Master before selecting another Remote"); return; }
+    if (linked && settings.peer == c.value) { message("Peer already connected"); return; }
     const Node* node = discovery.find(c.value);
-    if (node && !node->master && !node->peer && uint32_t(now - node->lastHeard) < PeerTimeoutMs) {
-      settings.pair(node->id); peerSession = node->session; received.reset();
-      Packet p = packet(Kind::Pair); startPending(p, now); ok = true;
+    if (!node || uint32_t(now - node->lastHeard) >= PeerTimeoutMs) { ++stats.commandRejects; message("Remote not heard recently; check power and RF settings"); return; }
+    if (node->master) { ++stats.commandRejects; message("Both boards are Master; change one to Remote with a 6-second hold"); return; }
+    if (node->peer && node->peer != id) { ++stats.commandRejects; message("Remote paired elsewhere; hold Remote PRG 8 seconds to unpair"); return; }
+    if (node) {
+      settings.pair(node->id);
+      if (peerSession != node->session) { peerSession = node->session; received.reset(); }
+      Packet p = packet(Kind::Pair); startPending(p, now); message("Pair request sending; waiting for Remote ACK"); ok = true;
     }
   } else if (c.type == CommandType::Unpair && !havePending && !messageQueued && !settings.pending && !serial.incoming.size() && !serial.outgoing.size()) {
     settings.pair(0); peerSession = 0; received.reset(); linked = false; fallback(now); openPairing(now); ok = true;
@@ -285,7 +298,7 @@ void ReliableLink::snapshot(Snapshot& out, uint32_t now) {
   out.rxQueued = serial.outgoing.size(); out.logQueued = log.size(); out.preset = settings.active.preset;
   out.interfaceMode = uint8_t(serial.getMode()); out.activeInterface = uint8_t(serial.getActive());
   out.master = settings.master; out.linked = linked; out.seenPacket = seenPacket;
-  out.settingsPending = settings.pending; out.pairingOpen = !due(now, pairUntil);
+  out.settingsPending = settings.pending; out.pairingOpen = !settings.peer || !due(now, pairUntil);
   out.rssi = rssi; out.snr = snr; snprintf(out.status, sizeof(out.status), "%s", status);
 }
 }
