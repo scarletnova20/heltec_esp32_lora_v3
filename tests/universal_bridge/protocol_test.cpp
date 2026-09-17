@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include "ReliableLink.h"
+#include "ButtonMenu.h"
 
 uint32_t testNow = 0;
 FakeEsp ESP;
@@ -127,4 +128,58 @@ static void failedSettingsAndStaleSession() {
   assert(w.a.settings.active.preset==1&&w.b.settings.active.preset==1);
   assert(w.a.snapshot().linked&&w.b.snapshot().linked);
 }
-int main(){framing();observer();bidirectional();boundedRetries();saturation();pairingAndSettings();failedSettingsAndStaleSession();std::cout<<"All bridge protocol, transport, discovery, settings and observer tests passed\n";}
+static void buttonMenu() {
+  ButtonMenu menu;
+  assert(menu.update(true,false,false,100)==ButtonAction::None);
+  assert(menu.update(false,false,false,2200)==ButtonAction::None);
+  assert(menu.isOpen()&&!menu.sendSelected());
+  menu.update(false,true,false,2250);assert(!menu.sendSelected()); // Suppress release leftovers.
+  assert(menu.update(false,true,false,2600)==ButtonAction::None);
+  assert(menu.sendSelected());
+  assert(menu.update(false,false,true,2900)==ButtonAction::SendMessage);
+  assert(!menu.isOpen());
+  menu.update(true,false,false,4000);menu.update(false,false,false,7000);
+  assert(menu.isOpen()); // The old 3-second gesture must no longer restart the board.
+  assert(menu.update(false,false,true,7400)==ButtonAction::None);assert(!menu.isOpen()); // Back.
+  assert(menu.update(false,true,false,8000)==ButtonAction::CycleInterface);
+  assert(menu.update(false,false,true,8500)==ButtonAction::OpenPairing);
+  menu.update(true,false,false,10000);
+  assert(menu.update(false,false,false,16000)==ButtonAction::ChangeRole);
+  menu.update(true,false,false,18000);
+  assert(menu.update(false,false,false,26000)==ButtonAction::Unpair);
+  menu.update(true,false,false,28000);menu.update(false,false,false,30000);
+  menu.update(true,false,false,31000);
+  assert(menu.update(false,false,false,40000)==ButtonAction::None);assert(!menu.isOpen()); // Long press in menu only exits.
+  ButtonMenu wrap;wrap.update(true,false,false,0xffffff00u);wrap.update(false,false,false,0xffffff00u+2200u);
+  assert(wrap.isOpen());
+}
+static void boardMessages() {
+  World w;w.connect();Command send;send.type=CommandType::TestMessage;
+  w.a.link.command(send,testNow);w.b.link.command(send,testNow);
+  assert(w.a.snapshot().sentMessage.state==MessageState::Queued);
+  w.a.link.command(send,testNow); // A second request must not overwrite/repeat the queued message.
+  assert(w.a.snapshot().counters.commandRejects==1);
+  w.dropAcks=2;w.run(90000);
+  const auto a=w.a.snapshot(),b=w.b.snapshot();
+  assert(a.sentMessage.state==MessageState::Delivered&&b.sentMessage.state==MessageState::Delivered);
+  assert(a.receivedMessage.state==MessageState::Received&&b.receivedMessage.state==MessageState::Received);
+  assert(a.receivedMessage.node==2&&b.receivedMessage.node==1);
+  assert(!memcmp(a.receivedMessage.data,"Hello from 00000002",a.receivedMessage.length));
+  assert(!memcmp(b.receivedMessage.data,"Hello from 00000001",b.receivedMessage.length));
+  assert(w.atA.empty()&&w.atB.empty()); // Test messages never reach USB/UART.
+  assert(a.counters.txPackets==1&&a.counters.rxPackets==1&&b.counters.rxPackets==1);
+  PayloadEvent e;unsigned tx=0,rx=0;while(w.a.log.pop(e)){if(e.tx)++tx;else ++rx;}
+  assert(tx==1&&rx==1); // ACK loss must not repeat console events.
+  const uint8_t binary[]={0,0xfd,13,10,0xff};
+  w.a.serial.incoming.push(binary,sizeof(binary));w.b.serial.incoming.push(binary,sizeof(binary));
+  w.a.link.command(send,testNow);w.run(90000);
+  assert(w.atA==std::vector<uint8_t>(binary,binary+sizeof(binary))&&w.atB==w.atA);
+  assert(w.a.snapshot().sentMessage.state==MessageState::Delivered);
+  World offline(false);offline.a.link.command(send,testNow);
+  assert(offline.a.snapshot().sentMessage.state==MessageState::Rejected);
+  assert(offline.a.snapshot().counters.txPackets==0);
+  World lost;lost.connect();lost.allAcks=true;lost.a.link.command(send,testNow);lost.run(90000);
+  assert(lost.a.snapshot().sentMessage.state==MessageState::Unconfirmed);
+  assert(lost.b.snapshot().counters.rxPackets==1&&lost.atB.empty());
+}
+int main(){framing();observer();bidirectional();boundedRetries();saturation();pairingAndSettings();failedSettingsAndStaleSession();buttonMenu();boardMessages();std::cout<<"All bridge protocol, transport, discovery, settings, observer, button-menu and board-message tests passed\n";}

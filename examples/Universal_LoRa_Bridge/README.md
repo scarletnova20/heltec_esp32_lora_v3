@@ -2,6 +2,8 @@
 
 One firmware image for two **Heltec WiFi LoRa 32 V3 / SX1262** boards. This application uses the repository's radio, OLED and button instances without modifying the upstream library. It transports opaque bytes between the on-board USB serial connection or a separate hardware UART on each board. It does not interpret MAVLink or other serial protocols.
 
+**OLED power on V3.2:** the application enables Vext (GPIO 36, active LOW) before calling `heltec_setup()`. V3.2 powers the OLED through this rail; enabling it after display initialization is too late. Startup stages appear on the OLED before radio and Wi-Fi initialization. See the [upstream hardware-revision report](https://github.com/ropg/heltec_esp32_lora_v3/issues/84). This also enables the external Vext output while the bridge runs.
+
 ## Build and flash
 
 Dependencies used by the application:
@@ -32,7 +34,7 @@ For Arduino IDE, install this repository as a library, open `Universal_LoRa_Brid
 ## Connect and pair
 
 1. Attach the antennas and power both boards. Both initially start as Remote with Wi-Fi off.
-2. On the board attached to your dashboard computer, hold **PRG for 3–7 seconds, then release**. It saves the Master role and restarts. Repeat this gesture to switch back to Remote. Role selection is stored in NVS, not compiled into the firmware.
+2. On the board attached to your dashboard computer, hold **PRG for 6–7 seconds, then release**. It saves the Master role and restarts. Repeat this gesture to switch back to Remote. Role selection is stored in NVS, not compiled into the firmware. The earlier 3-second role gesture now opens the message menu instead.
 3. Join `LoRa-Bridge-XXXXXXXX`, password **`LoRaBridge32`**, and open **http://192.168.4.1**. The HTTP page uses **ws://192.168.4.1:81/ws** for both live payloads and statistics. It does not poll or refresh for messages.
 4. Remote pairing is open for 60 seconds after startup. A **double-click** opens another 60-second window. Select the discovered Remote using **Pair** on the Master dashboard.
 5. Pairing is persistent and one-to-one. To replace a pair, stop senders and clear pairing on **both** boards: hold PRG **8 seconds or longer, then release**, or use the dashboard's local Unpair control on Master. Unpair is rejected while application queues or settings transactions are busy.
@@ -40,6 +42,20 @@ For Arduino IDE, install this repository as a library, open `Universal_LoRa_Brid
 The local Master is shown separately from discovered nodes and never needs to hear its own announcement. Each valid received protocol frame updates its sender's discovery `lastHeard`. Discovery entries are bounded to eight; stale entries remain visible with their age and cannot be selected for pairing.
 
 Master/Remote controls Wi-Fi and settings authority; it does not determine serial direction. Both boards transmit and receive application bytes. Neither is permanently assigned to an air or ground endpoint.
+
+## PRG message menu
+
+After pairing, either board can send a test message without a computer:
+
+1. From the rotating status screens, **hold PRG for about 2 seconds, then release** (2–5 seconds opens the menu).
+2. The menu shows **Back** and **Send message**, initially selecting Back. **Single-click** to move between them; **double-click** to select.
+3. Selecting Send message queues `Hello from XXXXXXXX`, using the sender's node ID. The sender shows **TX queued**, **TX sending**, then **TX delivered** after an ACK, or **TX unconfirmed** when retries expire. An unpaired/offline board shows a send-unavailable message.
+4. The receiver shows **RX message**, the sender's ID and the text for eight seconds. The last received test message remains available on an additional rotating OLED page.
+5. Select Back to return to the status screens. Holding PRG for two seconds inside the menu also exits; it never changes roles or unpairs from inside the menu.
+
+Outside the menu, single-click still cycles serial interfaces, double-click opens pairing, a **6–7 second** hold changes role, and an **8+ second** hold unpairs. Gestures take effect on release. The menu does not pause serial or radio processing.
+
+Button messages use a dedicated reliable RF message type with ACKs, bounded retries and duplicate suppression. **They never enter either board's USB/UART byte stream.** The Master dashboard observes their payload once as TX or RX, using the same nonblocking copy logger. Packet/byte counters include these messages. Web SEND retains its existing behavior of explicitly injecting bytes into the remote serial stream. Flash this updated firmware on **both** boards for OLED message support; older firmware ignores the new message type. There is one bounded queued button message, which expires after 30 seconds if it cannot be scheduled.
 
 ## Serial wiring and selection
 
@@ -80,7 +96,7 @@ Application diagnostics never write to the telemetry port. ESP32 ROM/bootloader 
 
 ## Master payload console
 
-- **TX** is the local queued payload copied when selected for RF transport, once per chunk, before its first attempt. **RX** is a Remote payload copied after validation/deduplication and acceptance into the local serial output queue.
+- **TX** is the local queued payload copied when selected for RF transport, once per chunk, before its first attempt. **RX** is a Remote payload copied after validation/deduplication and acceptance into the local serial output queue. PRG test messages also appear as TX/RX, but are delivered to the OLED instead of serial.
 - Timestamps are Master uptime in milliseconds, displayed as `hh:mm:ss.mmm`; they are not wall-clock time. Millisecond timestamps wrap after approximately 49 days.
 - **TEXT** displays printable ASCII and escapes other bytes as `\xNN`. **HEX** displays every byte. **AUTO** uses text only for entirely printable ASCII chunks. Original bytes remain available when changing display modes.
 - **Clear** clears only the browser's history. **Autoscroll** controls only the browser viewport. History is limited to 500 events.
@@ -126,7 +142,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -I tests/universal_bridge/fakes -I examples
 node tests/universal_bridge/dashboard_test.js
 ```
 
-The dashboard test executes the embedded JavaScript and checks live TX/RX rendering, format switching, Clear, Autoscroll, bounded history, safe text rendering and text/HEX injection. CI also compiles the sketch for the Heltec V3.
+The dashboard test executes the embedded JavaScript and checks live TX/RX rendering, format switching, Clear, Autoscroll, bounded history, safe text rendering and text/HEX injection. Protocol tests additionally exercise menu gestures, both directions of button messaging, lost message ACKs, duplicate suppression, unconfirmed delivery, and separation from concurrent binary serial data. CI also compiles the sketch for the Heltec V3.
 
 Before operational use, perform these tests with two physical boards:
 
@@ -137,6 +153,7 @@ Before operational use, perform these tests with two physical boards:
 5. Interrupt RF reception to exercise retries and disconnect one peer long enough to hit the retry limit. Verify explicit unconfirmed counters and no repeated downstream payload from ACK loss.
 6. Try all RF presets/UART bauds, restart either board, and interrupt a settings transition. Verify eventual Balanced rendezvous and re-negotiation.
 7. Verify rotating OLED pages, discovery ages, local Master separation, interface overrides and saved roles after power cycling.
+8. Hold PRG for two seconds, select Send message, and check sender ACK status and the receiving OLED. Repeat from the other board and during paced binary serial traffic; test-message text must never appear in serial captures. Confirm Back exits without changing the serial interface or role.
 
 Hardware timings, usable range, RF interference and electrical UART behavior require this bench validation; simulation does not establish those properties.
 

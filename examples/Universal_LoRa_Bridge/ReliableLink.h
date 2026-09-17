@@ -24,6 +24,9 @@ class ReliableLink {
   bool haveAck = false, seenPacket = false, linked = false;
   uint8_t attempts = 0;
   Packet pending, ack;
+  Packet queuedMessage;
+  bool messageQueued = false;
+  OledMessage sentMessage, receivedMessage;
   ReceiveWindow received;
   uint8_t wire[FrameMax]{};
   float rssi = 0, snr = 0;

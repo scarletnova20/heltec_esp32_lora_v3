@@ -20,7 +20,7 @@ bool ReliableLink::begin() {
   if (!ready) { message("Radio init failed; check hardware"); return false; }
   radio.setCRC(true);
   pairUntil = millis() + 60000; nextHello = millis() + esp_random() % 1000;
-  message(settings.master ? "Master: select a discovered Remote" : "Remote: hold button 3s to become Master");
+  message(settings.master ? "Master: select a discovered Remote" : "Remote: hold button 6s to become Master");
   listen(); return true;
 }
 void ReliableLink::listen() {
@@ -56,9 +56,14 @@ void ReliableLink::acknowledge(const Packet& p) {
   ack.ackSession = p.session; haveAck = true;
 }
 void ReliableLink::complete(bool success, uint32_t now) {
-  if (pending.kind == Kind::Data) {
+  if (pending.kind == Kind::Data || pending.kind == Kind::Message) {
     if (success) ++stats.acknowledged;
     else { ++stats.failed; stats.failedBytes += pending.length; message("Retry limit: payload delivery unconfirmed"); }
+    if (pending.kind == Kind::Message) {
+      sentMessage.state = success ? MessageState::Delivered : MessageState::Unconfirmed;
+      sentMessage.timestamp = now;
+      message(success ? "Test message delivered" : "Test message delivery unconfirmed");
+    }
   } else if (pending.kind == Kind::Settings) {
     if (success) {
       Settings value; value.preset = pending.data[0]; value.baud = get32(pending.data + 1); value.token = get32(pending.data + 5);
@@ -87,7 +92,7 @@ void ReliableLink::receive(uint32_t now) {
     if (peerSession != p.session) {
       peerSession = p.session; received.reset();
       // A pending payload may have been delivered before the peer rebooted; don't replay it into a new session.
-      if (havePending && pending.kind == Kind::Data) complete(false, now);
+      if (havePending && (pending.kind == Kind::Data || pending.kind == Kind::Message)) complete(false, now);
     }
     if (p.data[5] != settings.active.preset || get32(p.data + 10) != settings.active.token ||
         (settings.active.token && get32(p.data + 6) != settings.active.baud)) return;
@@ -110,9 +115,18 @@ void ReliableLink::receive(uint32_t now) {
     if (!p.length && havePending && p.ackSession == session && p.sequence == pending.sequence && attempts) complete(true, now);
     return;
   }
-  if (p.kind != Kind::Data && p.kind != Kind::Settings) return;
+  if (p.kind != Kind::Data && p.kind != Kind::Settings && p.kind != Kind::Message) return;
+  if (p.kind == Kind::Message && (!p.length || p.length > MessageMax)) return;
   if (received.duplicate(p.sequence)) { ++stats.duplicates; acknowledge(p); return; }
-  if (p.kind == Kind::Data) {
+  if (p.kind == Kind::Message) {
+    // Explicit board-to-board messages never enter the transparent serial stream.
+    receivedMessage.state = MessageState::Received; receivedMessage.timestamp = now;
+    receivedMessage.node = p.source; receivedMessage.length = p.length;
+    memcpy(receivedMessage.data, p.data, p.length);
+    received.accept(p.sequence); acknowledge(p);
+    ++stats.rxPackets; stats.rxBytes += p.length;
+    observe(false, p.data, p.length, now);
+  } else if (p.kind == Kind::Data) {
     if (!p.length) return;
     // Reserve downstream space BEFORE ACK. Never acknowledge bytes that cannot be retained.
     if (!serial.outgoing.push(p.data, p.length)) { ++stats.backpressure; return; }
@@ -121,7 +135,7 @@ void ReliableLink::receive(uint32_t now) {
     observe(false, p.data, p.length, now);
   } else {
     if (settings.master || p.length != 9 || p.data[0] > 2 || !validBaud(get32(p.data + 1)) ||
-        settings.pending || havePending || serial.incoming.size() || serial.outgoing.size()) return;
+        settings.pending || havePending || messageQueued || serial.incoming.size() || serial.outgoing.size()) return;
     Settings value; value.preset = p.data[0]; value.baud = get32(p.data + 1); value.token = get32(p.data + 5);
     if (!value.token) return;
     settings.stage(value, now); received.accept(p.sequence); acknowledge(p);
@@ -136,6 +150,10 @@ void ReliableLink::fallback(uint32_t now) {
 }
 void ReliableLink::tick(bool irq, uint32_t now) {
   serial.poll(stats);
+  if (messageQueued && uint32_t(now - sentMessage.timestamp) >= PeerTimeoutMs) {
+    messageQueued = false; sentMessage.state = MessageState::Rejected; sentMessage.timestamp = now;
+    message("Test message queue expired; try again");
+  }
   if (!ready) return;
   if (transmitting) {
     if (!irq && !due(now, radioDeadline)) return;
@@ -192,7 +210,13 @@ void ReliableLink::tick(bool irq, uint32_t now) {
     put32(p.data + 6, settings.active.baud); put32(p.data + 10, settings.active.token);
     send(p, now); nextHello = now + DiscoveryMs + esp_random() % 1000; return;
   }
-  if (!havePending && linked && !settings.pending && serial.incoming.size()) {
+  if (!havePending && linked && !settings.pending && messageQueued) {
+    messageQueued = false;
+    ++stats.txPackets; stats.txBytes += queuedMessage.length;
+    observe(true, queuedMessage.data, queuedMessage.length, now);
+    sentMessage.state = MessageState::Sending; sentMessage.timestamp = now;
+    startPending(queuedMessage, now);
+  } else if (!havePending && linked && !settings.pending && serial.incoming.size()) {
     Packet p = packet(Kind::Data); p.length = serial.incoming.peek(p.data, PayloadMax);
     serial.incoming.discard(p.length);
     ++stats.txPackets; stats.txBytes += p.length; observe(true, p.data, p.length, now);
@@ -207,7 +231,26 @@ void ReliableLink::tick(bool irq, uint32_t now) {
 }
 void ReliableLink::command(const Command& c, uint32_t now) {
   bool ok = false;
-  if (c.type == CommandType::Send) {
+  if (c.type == CommandType::TestMessage) {
+    if (!ready || !linked || !settings.peer || settings.pending || messageQueued ||
+        (havePending && pending.kind != Kind::Data)) {
+      ++stats.commandRejects;
+      // Do not replace the display state of an already queued/in-flight message.
+      if (!messageQueued && !(havePending && pending.kind == Kind::Message)) {
+        sentMessage = OledMessage{}; sentMessage.state = MessageState::Rejected; sentMessage.timestamp = now;
+      }
+      message(!linked ? "Pair and connect before sending" : "Link busy; try Send message again");
+      return;
+    }
+    queuedMessage = packet(Kind::Message);
+    char text[MessageMax + 1];
+    queuedMessage.length = snprintf(text, sizeof(text), "Hello from %08lX", (unsigned long)id);
+    memcpy(queuedMessage.data, text, queuedMessage.length);
+    sentMessage = OledMessage{}; sentMessage.state = MessageState::Queued; sentMessage.timestamp = now;
+    sentMessage.node = settings.peer; sentMessage.length = queuedMessage.length;
+    memcpy(sentMessage.data, queuedMessage.data, queuedMessage.length);
+    messageQueued = true; message("Test message queued"); ok = true;
+  } else if (c.type == CommandType::Send) {
     ok = c.length && c.length <= PayloadMax && serial.incoming.push(c.data, c.length);
     if (ok) message("Web payload queued (no serial echo)");
   } else if (c.type == CommandType::Pair && settings.master && !havePending && !settings.pending && !settings.peer) {
@@ -216,11 +259,11 @@ void ReliableLink::command(const Command& c, uint32_t now) {
       settings.pair(node->id); peerSession = node->session; received.reset();
       Packet p = packet(Kind::Pair); startPending(p, now); ok = true;
     }
-  } else if (c.type == CommandType::Unpair && !havePending && !settings.pending && !serial.incoming.size() && !serial.outgoing.size()) {
+  } else if (c.type == CommandType::Unpair && !havePending && !messageQueued && !settings.pending && !serial.incoming.size() && !serial.outgoing.size()) {
     settings.pair(0); peerSession = 0; received.reset(); linked = false; fallback(now); openPairing(now); ok = true;
   } else if (c.type == CommandType::Interface && c.value <= 2 && !serial.incoming.size() && !serial.outgoing.size() && !havePending) {
     settings.interface(Interface(c.value)); serial.setMode(Interface(c.value)); message("Serial interface selection updated"); ok = true;
-  } else if (c.type == CommandType::Settings && settings.master && linked && !havePending && !settings.pending &&
+  } else if (c.type == CommandType::Settings && settings.master && linked && !havePending && !messageQueued && !settings.pending &&
              !serial.incoming.size() && !serial.outgoing.size() && c.value <= 2 && validBaud(c.baud)) {
     Packet p = packet(Kind::Settings); p.length = 9; p.data[0] = c.value;
     put32(p.data + 1, c.baud); put32(p.data + 5, esp_random() | 1u); startPending(p, now); ok = true;
@@ -235,6 +278,7 @@ void ReliableLink::snapshot(Snapshot& out, uint32_t now) {
     sampleAt = now; sampleTx = stats.txBytes; sampleRx = stats.rxBytes;
   }
   out = Snapshot{}; out.counters = stats; memcpy(out.nodes, discovery.nodes, sizeof(out.nodes));
+  out.sentMessage = sentMessage; out.receivedMessage = receivedMessage;
   out.now = now; out.local = id; out.peer = settings.peer; out.lastPacket = lastPacket; out.linkSince = linkSince;
   out.baud = settings.active.baud; out.txRate = txRate; out.rxRate = rxRate;
   out.txQueued = serial.incoming.size() + (havePending && pending.kind == Kind::Data ? pending.length : 0);

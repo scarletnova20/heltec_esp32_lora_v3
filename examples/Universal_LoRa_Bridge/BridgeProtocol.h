@@ -7,7 +7,7 @@ namespace bridge {
 constexpr size_t PayloadMax = 192;
 constexpr size_t HeaderSize = 28;
 constexpr size_t FrameMax = HeaderSize + PayloadMax + 4;
-enum class Kind : uint8_t { Hello = 1, Pair, Data, Ack, Settings };
+enum class Kind : uint8_t { Hello = 1, Pair, Data, Ack, Settings, Message };
 struct Packet {
   Kind kind = Kind::Hello;
   uint32_t source = 0, destination = 0, session = 0, sequence = 0, ackSession = 0;
@@ -43,7 +43,7 @@ inline bool decode(const uint8_t* in, size_t n, Packet& p) {
   if (n < HeaderSize + 4 || in[0] != 'U' || in[1] != 'B' || in[2] != 1 || in[6] || in[7]) return false;
   const size_t length = in[4] | uint16_t(in[5]) << 8;
   if (length > PayloadMax || n != HeaderSize + length + 4 ||
-      in[3] < uint8_t(Kind::Hello) || in[3] > uint8_t(Kind::Settings) ||
+      in[3] < uint8_t(Kind::Hello) || in[3] > uint8_t(Kind::Message) ||
       crc32(in, n - 4) != get32(in + n - 4) || !get32(in + 8) || !get32(in + 16)) return false;
   p.kind = Kind(in[3]); p.length = uint16_t(length);
   p.source = get32(in + 8); p.destination = get32(in + 12);

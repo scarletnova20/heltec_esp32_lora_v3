@@ -11,6 +11,15 @@ constexpr size_t BufferSize = 4096, LogDepth = 24, NodeCount = 8;
 constexpr uint8_t MaxAttempts = 5;
 constexpr uint32_t DiscoveryMs = 4000, PeerTimeoutMs = 30000;
 constexpr uint32_t SwitchDelayMs = 15000, TrialMs = 45000;
+constexpr size_t MessageMax = 48;
+constexpr uint32_t MessageToastMs = 8000;
+enum class MessageState : uint8_t { None, Queued, Sending, Delivered, Unconfirmed, Received, Rejected };
+struct OledMessage {
+  MessageState state = MessageState::None;
+  uint32_t timestamp = 0, node = 0;
+  uint8_t length = 0;
+  uint8_t data[MessageMax]{};
+};
 struct Preset { const char* name; float bandwidth; uint8_t sf, cr; };
 constexpr Preset Presets[] = {{"Long Range", 125.0f, 11, 7}, {"Balanced", 250.0f, 9, 5}, {"High Speed", 500.0f, 7, 5}};
 inline bool validBaud(uint32_t n) { return n == 9600 || n == 19200 || n == 38400 || n == 57600 || n == 115200 || n == 230400; }
@@ -29,6 +38,7 @@ struct Node {
 };
 struct Snapshot {
   Counters counters;
+  OledMessage sentMessage, receivedMessage;
   Node nodes[NodeCount];
   uint32_t now = 0, local = 0, peer = 0, lastPacket = 0, linkSince = 0;
   uint32_t baud = DefaultBaud, txRate = 0, rxRate = 0;
@@ -38,7 +48,7 @@ struct Snapshot {
   float rssi = 0, snr = 0;
   char status[96] = "Starting";
 };
-enum class CommandType : uint8_t { Send, Pair, Settings, Interface, Unpair };
+enum class CommandType : uint8_t { Send, Pair, Settings, Interface, Unpair, TestMessage };
 struct Command {
   CommandType type = CommandType::Send;
   uint32_t value = 0, baud = 0;
